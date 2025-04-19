@@ -1,9 +1,59 @@
-{
-    "name": "aligncloud-devbot",
-    "version": "0.1.0",
-    "type": "module",
-    "dependencies": {
-      "@octokit/rest": "^20.0.0",
-      "openai": "^4.21.0"
-    }
+import { Octokit } from "@octokit/rest";
+import OpenAI from "openai";
+import { execSync } from "node:child_process";
+import { writeFileSync, readFileSync } from "node:fs";
+import process from "node:process";
+
+const GH_TOKEN   = process.env.GITHUB_TOKEN   || process.env.gh_token;
+const OPENAI_KEY = process.env.OPENAI_KEY     || process.env.openai_key;
+const PLAN       = process.env.plan;
+
+const octokit = new Octokit({ auth: GH_TOKEN });
+const openai  = new OpenAI({ apiKey: OPENAI_KEY });
+
+const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+
+// ---------- helper wrappers ----------
+async function editFile(path, patch) {
+  const content = readFileSync(path, "utf8");
+  const updated = applyPatch(content, patch);    // tiny diff‑patch helper
+  writeFileSync(path, updated);
+}
+
+async function runShell(cmd) {
+  return execSync(cmd, { stdio: "pipe" }).toString();
+}
+
+async function createPR(branch, title, body) {
+  await octokit.git.createRef({
+    owner, repo,
+    ref: `refs/heads/${branch}`,
+    sha: process.env.GITHUB_SHA,
+  });
+  await octokit.pulls.create({ owner, repo, head: branch, base: "main", title, body });
+}
+// ---------- main ----------
+(async () => {
+  console.log("DevBot plan:", PLAN);
+
+  const chat = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system",   content: "You are DevBot for AlignCloud..." },
+      { role: "user",     content: PLAN }
+    ],
+    tools: [
+      { name: "edit_file", description: "...", parameters: { type: "object", properties: { path:{type:"string"},patch:{type:"string"} }, required:["path","patch"]}},
+      { name: "run_shell", parameters: { type: "object", properties: { cmd:{type:"string"} }, required:["cmd"]}},
+      { name: "create_pr", parameters: { type: "object", properties: { branch:{type:"string"},title:{type:"string"},body:{type:"string"}}, required:["branch","title","body"]}}
+    ],
+    tool_choice: "auto"
+  });
+
+  for (const call of chat.choices[0].message.tool_calls || []) {
+    const { name, arguments: args } = call;
+    if (name === "edit_file") await editFile(args.path, args.patch);
+    if (name === "run_shell") await runShell(args.cmd);
+    if (name === "create_pr") await createPR(args.branch, args.title, args.body);
   }
+})();
